@@ -1,0 +1,1045 @@
+-- Servisler
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
+
+local player = Players.LocalPlayer
+
+-- Durum Değişkenleri
+local farmMode = "None"
+local attackDirection = "Alt"
+local currentLanguage = "TR"
+local scriptRunning = true
+local currentTarget = nil
+local isTeleporting = false
+local isKeyVerified = false
+local PUSL = nil
+
+-- ==========================================
+-- PANDA AUTH GÜVENLİ BAĞLANTI (ASENKRON)
+-- ==========================================
+task.spawn(function()
+    local success, lib = pcall(function()
+        return loadstring(game:HttpGet("https://secure.pandauth.com/pv4/lib"))()
+    end)
+    if success and lib and type(lib.configure) == "function" then
+        PUSL = lib
+        PUSL.configure({
+            serviceId = "sizotipalvamplifescript",
+        })
+    else
+        warn("[Panda] Library failed to initialize.")
+    end
+end)
+
+-- ESP Durumları
+local espHunter = false
+local espGuard = false
+local espHuman = false
+local espPlayer = false
+local activeEspObjects = {}
+
+-- Bug Algılama (Anti-Stuck) Değişkenleri
+local blacklistedTargets = {}
+local attackTimer = tick()
+local lastHealth = 0
+
+-- Vur-Kaç Pozisyon Ayarları
+local safeOffset = CFrame.new(0, -12, 0) 
+local attackOffset = CFrame.new(0, -4.5, -1.0) 
+local currentOffset = safeOffset 
+
+-- ==========================================
+-- HIZLI VE AKILLI YÜRÜYEREK TELEPORT (WalkSpeed 300)
+-- ==========================================
+local function walkTeleportTo(targetPosition)
+    if isTeleporting then return end
+    isTeleporting = true
+    
+    task.spawn(function()
+        local char = player.Character
+        if not char or not char:FindFirstChild("HumanoidRootPart") or not char:FindFirstChild("Humanoid") then
+            isTeleporting = false
+            return
+        end
+        
+        local hrp = char.HumanoidRootPart
+        local humanoid = char.Humanoid
+        local originalSpeed = humanoid.WalkSpeed
+        
+        humanoid.WalkSpeed = 300
+        
+        local speedConnection
+        speedConnection = RunService.Heartbeat:Connect(function()
+            if isTeleporting and humanoid and humanoid.Parent then
+                humanoid.WalkSpeed = 300
+            else
+                if speedConnection then speedConnection:Disconnect() end
+            end
+        end)
+        
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+            WaypointSpacing = 3,
+            Costs = { Water = 20 }
+        })
+        
+        local success = pcall(function()
+            path:ComputeAsync(hrp.Position, targetPosition)
+        end)
+        
+        if success and path.Status == Enum.PathStatus.Success then
+            local waypoints = path:GetWaypoints()
+            
+            for _, waypoint in ipairs(waypoints) do
+                if not scriptRunning or not char or humanoid.Health <= 0 then break end
+                
+                humanoid:MoveTo(waypoint.Position)
+                
+                if waypoint.Action == Enum.PathWaypointAction.Jump then
+                    humanoid.Jump = true
+                end
+                
+                local reached = false
+                local connection
+                connection = humanoid.MoveToFinished:Connect(function(isReached)
+                    reached = true
+                    if connection then connection:Disconnect() end
+                end)
+                
+                local t = tick()
+                while not reached and tick() - t < 1.0 do
+                    task.wait(0.02)
+                end
+                if connection then connection:Disconnect() end
+            end
+        else
+            while scriptRunning and char and hrp and humanoid.Health > 0 do
+                local currentPos = hrp.Position
+                local distance = (Vector3.new(targetPosition.X, currentPos.Y, targetPosition.Z) - currentPos).Magnitude
+                if distance < 5 then break end
+                humanoid:MoveTo(targetPosition)
+                task.wait(0.05)
+            end
+        end
+        
+        if speedConnection then speedConnection:Disconnect() end
+        if humanoid and humanoid.Parent then
+            humanoid.WalkSpeed = originalSpeed
+        end
+        
+        isTeleporting = false
+    end)
+end
+
+-- ==========================================
+-- DİNAMİK MESAFE (OFFSET) AYARLAYICI
+-- ==========================================
+local function updateOffsets()
+    local ySafe = 12
+    local yAttack = 4.5
+    local zAttack = 1.0
+
+    if farmMode == "VampireMonster" then
+        ySafe = 15       
+        yAttack = 3.0    
+        zAttack = 0.0    
+    elseif farmMode == "Human" then
+        ySafe = 12
+        yAttack = 3.2    
+        zAttack = 0.5    
+    elseif farmMode == "Hunter" or farmMode == "Guard" then
+        ySafe = 12
+        yAttack = 4.5
+        zAttack = 1.0
+    end
+
+    if attackDirection == "Alt" then
+        safeOffset = CFrame.new(0, -ySafe, 0)
+        attackOffset = CFrame.new(0, -yAttack, -zAttack)
+    elseif attackDirection == "Üst" then
+        safeOffset = CFrame.new(0, ySafe, 0)
+        attackOffset = CFrame.new(0, yAttack, -zAttack)
+    elseif attackDirection == "Arka" then
+        safeOffset = CFrame.new(0, 0, ySafe)
+        local backZ = 3.5
+        if farmMode == "VampireMonster" then backZ = 4.0 end
+        if farmMode == "Human" then backZ = 2.5 end 
+        attackOffset = CFrame.new(0, 0, backZ) 
+    end
+end
+
+-- Eski arayüzü temizle
+if CoreGui:FindFirstChild("VampireHubUI") then
+    CoreGui.VampireHubUI:Destroy()
+end
+
+-- ==========================================
+-- UI (ARAYÜZ) OLUŞTURMA & OKUNAKLI KEY EKRANI
+-- ==========================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "VampireHubUI"
+ScreenGui.Parent = CoreGui
+
+-- 1. Key Giriş Arayüzü
+local KeySystemFrame = Instance.new("Frame")
+KeySystemFrame.Size = UDim2.new(0, 420, 0, 240)
+KeySystemFrame.Position = UDim2.new(0.5, -210, 0.5, -120)
+KeySystemFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+KeySystemFrame.BorderSizePixel = 0
+KeySystemFrame.Parent = ScreenGui
+KeySystemFrame.Active = true
+KeySystemFrame.Draggable = true
+
+local KeyCorner = Instance.new("UICorner")
+KeyCorner.CornerRadius = UDim.new(0, 8)
+KeyCorner.Parent = KeySystemFrame
+
+local KeyStroke = Instance.new("UIStroke")
+KeyStroke.Color = Color3.fromRGB(180, 30, 30)
+KeyStroke.Thickness = 2
+KeyStroke.Parent = KeySystemFrame
+
+local KeyTitle = Instance.new("TextLabel")
+KeyTitle.Size = UDim2.new(1, 0, 0, 45)
+KeyTitle.Position = UDim2.new(0, 0, 0, 15)
+KeyTitle.BackgroundTransparency = 1
+KeyTitle.Text = "🩸 VAMP LIFE - KEY SYSTEM"
+KeyTitle.TextColor3 = Color3.fromRGB(255, 60, 60)
+KeyTitle.Font = Enum.Font.GothamBold
+KeyTitle.TextSize = 18
+KeyTitle.Parent = KeySystemFrame
+
+local KeyInputBox = Instance.new("TextBox")
+KeyInputBox.Size = UDim2.new(1, -48, 0, 45)
+KeyInputBox.Position = UDim2.new(0, 24, 0, 70)
+KeyInputBox.BackgroundColor3 = Color3.fromRGB(26, 26, 26)
+KeyInputBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+KeyInputBox.PlaceholderText = "Key'i buraya yapıştırın..."
+KeyInputBox.PlaceholderColor3 = Color3.fromRGB(160, 160, 160)
+KeyInputBox.Font = Enum.Font.GothamSemibold
+KeyInputBox.TextSize = 14
+KeyInputBox.Text = ""
+KeyInputBox.Parent = KeySystemFrame
+
+local InputCorner = Instance.new("UICorner")
+InputCorner.CornerRadius = UDim.new(0, 6)
+InputCorner.Parent = KeyInputBox
+
+local SubmitKeyBtn = Instance.new("TextButton")
+SubmitKeyBtn.Size = UDim2.new(1, -48, 0, 40)
+SubmitKeyBtn.Position = UDim2.new(0, 24, 0, 125)
+SubmitKeyBtn.BackgroundColor3 = Color3.fromRGB(180, 30, 30)
+SubmitKeyBtn.Text = "KEY'İ ONAYLA"
+SubmitKeyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SubmitKeyBtn.Font = Enum.Font.GothamBold
+SubmitKeyBtn.TextSize = 14
+SubmitKeyBtn.Parent = KeySystemFrame
+
+local SubmitCorner = Instance.new("UICorner")
+SubmitCorner.CornerRadius = UDim.new(0, 6)
+SubmitCorner.Parent = SubmitKeyBtn
+
+local GetKeyBtn = Instance.new("TextButton")
+GetKeyBtn.Size = UDim2.new(1, -48, 0, 32)
+GetKeyBtn.Position = UDim2.new(0, 24, 0, 175)
+GetKeyBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+GetKeyBtn.Text = "🔗 KEY AL (Linkini Otomatik Kopyala)"
+GetKeyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+GetKeyBtn.Font = Enum.Font.GothamBold
+GetKeyBtn.TextSize = 12
+GetKeyBtn.Parent = KeySystemFrame
+
+local GetKeyCorner = Instance.new("UICorner")
+GetKeyCorner.CornerRadius = UDim.new(0, 6)
+GetKeyCorner.Parent = GetKeyBtn
+
+-- Otomatik Panoya Kopyalama (Clipboard)
+GetKeyBtn.MouseButton1Click:Connect(function()
+    if PUSL and type(PUSL.getKeyUrl) == "function" then
+        local url = PUSL.getKeyUrl()
+        local success = pcall(function()
+            setclipboard(url)
+        end)
+        
+        if success then
+            GetKeyBtn.Text = "✅ Key Linki Panoya Kopyalandı!"
+            GetKeyBtn.TextColor3 = Color3.fromRGB(50, 255, 50)
+            task.wait(2.5)
+            GetKeyBtn.Text = "🔗 KEY AL (Linkini Otomatik Kopyala)"
+            GetKeyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            GetKeyBtn.Text = "❌ Kopyalanamadı (Tarayıcıdan Açın)"
+        end
+    else
+        GetKeyBtn.Text = "⏳ Kütüphane Yükleniyor, Bekleyin..."
+    end
+end)
+
+-- 2. Ana Pencere (Başlangıçta Gizli)
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 540, 0, 420)
+MainFrame.Position = UDim2.new(0.5, -270, 0.5, -210)
+MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+MainFrame.BorderSizePixel = 0
+MainFrame.Visible = false
+MainFrame.Parent = ScreenGui
+MainFrame.Active = true
+MainFrame.Draggable = true
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 8)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(150, 25, 25)
+MainStroke.Thickness = 1.5
+MainStroke.Parent = MainFrame
+
+-- Üst Bar (TopBar)
+local TopBar = Instance.new("Frame")
+TopBar.Size = UDim2.new(1, 0, 0, 38)
+TopBar.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+
+local TopBarCorner = Instance.new("UICorner")
+TopBarCorner.CornerRadius = UDim.new(0, 8)
+TopBarCorner.Parent = TopBar
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -20, 1, 0)
+Title.Position = UDim2.new(0, 12, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "🩸 Vamp Life v1.0"
+Title.TextColor3 = Color3.fromRGB(240, 240, 240)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 14
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = TopBar
+
+-- Sol Menü (Sidebar)
+local Sidebar = Instance.new("Frame")
+Sidebar.Size = UDim2.new(0, 140, 1, -38)
+Sidebar.Position = UDim2.new(0, 0, 0, 38)
+Sidebar.BackgroundColor3 = Color3.fromRGB(14, 14, 14)
+Sidebar.BorderSizePixel = 0
+Sidebar.Parent = MainFrame
+
+-- İçerik Alanı (ContentFrame)
+local ContentFrame = Instance.new("Frame")
+ContentFrame.Size = UDim2.new(1, -140, 1, -38)
+ContentFrame.Position = UDim2.new(0, 140, 0, 38)
+ContentFrame.BackgroundTransparency = 1
+ContentFrame.Parent = MainFrame
+
+-- Sekmeler
+local TpPage = Instance.new("ScrollingFrame")
+TpPage.Size = UDim2.new(1, 0, 1, 0)
+TpPage.BackgroundTransparency = 1
+TpPage.CanvasSize = UDim2.new(0, 0, 0, 360)
+TpPage.ScrollBarThickness = 3
+TpPage.Parent = ContentFrame
+TpPage.Visible = false
+
+local EspPage = Instance.new("Frame")
+EspPage.Size = UDim2.new(1, 0, 1, 0)
+EspPage.BackgroundTransparency = 1
+EspPage.Parent = ContentFrame
+EspPage.Visible = false
+
+local FarmingPage = Instance.new("Frame")
+FarmingPage.Size = UDim2.new(1, 0, 1, 0)
+FarmingPage.BackgroundTransparency = 1
+FarmingPage.Parent = ContentFrame
+FarmingPage.Visible = true
+
+local SettingsPage = Instance.new("Frame")
+SettingsPage.Size = UDim2.new(1, 0, 1, 0)
+SettingsPage.BackgroundTransparency = 1
+SettingsPage.Parent = ContentFrame
+SettingsPage.Visible = false
+
+local CreditPage = Instance.new("Frame")
+CreditPage.Size = UDim2.new(1, 0, 1, 0)
+CreditPage.BackgroundTransparency = 1
+CreditPage.Parent = ContentFrame
+CreditPage.Visible = false
+
+local CancelPage = Instance.new("Frame")
+CancelPage.Size = UDim2.new(1, 0, 1, 0)
+CancelPage.BackgroundTransparency = 1
+CancelPage.Parent = ContentFrame
+CancelPage.Visible = false
+
+-- Sidebar Buton Oluşturucu
+local function createNavButton(text, yPos)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -16, 0, 34)
+    btn.Position = UDim2.new(0, 8, 0, yPos)
+    btn.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+    btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 13
+    btn.Text = text
+    btn.Parent = Sidebar
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+    
+    return btn
+end
+
+local TpTabBtn = createNavButton("Teleport", 8)
+local EspTabBtn = createNavButton("ESP", 46)
+local FarmingTabBtn = createNavButton("Farming", 84)
+local SettingsTabBtn = createNavButton("Ayarlar", 122)
+local CreditTabBtn = createNavButton("Credit", 160)
+local CancelTabBtn = createNavButton("İptal Et", 198)
+CancelTabBtn.TextColor3 = Color3.fromRGB(255, 80, 80)
+
+-- ==========================================
+-- PANDA KEY DOĞRULAMA BUTON OLAYI
+-- ==========================================
+SubmitKeyBtn.MouseButton1Click:Connect(function()
+    if not PUSL then
+        KeyInputBox.PlaceholderText = "Kütüphane yüklenmedi! Bekleyin."
+        return
+    end
+
+    local userKey = KeyInputBox.Text
+    local result = PUSL.validate(userKey)
+
+    if result.success then
+        isKeyVerified = true
+        KeySystemFrame:Destroy()
+        MainFrame.Visible = true
+        print("[Panda] Authenticated. Premium:", result.isPremium)
+    else
+        KeyInputBox.Text = ""
+        KeyInputBox.PlaceholderText = "Geçersiz Key! / Invalid Key!"
+        KeyInputBox.PlaceholderColor3 = Color3.fromRGB(255, 50, 50)
+    end
+end)
+
+-- ==========================================
+-- CREDIT SEKMESİ İÇERİĞİ
+-- ==========================================
+local function createCreditLabel(text, yPos)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -24, 0, 40)
+    lbl.Position = UDim2.new(0, 12, 0, yPos)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(255, 70, 70)
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 16
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = CreditPage
+    return lbl
+end
+
+createCreditLabel("Discord: fazlamedical", 20)
+createCreditLabel("Roblox: qogenichan", 70)
+
+-- Teleport Noktaları
+local function createTpButton(text, yPos, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -24, 0, 36)
+    btn.Position = UDim2.new(0, 12, 0, yPos)
+    btn.BackgroundColor3 = Color3.fromRGB(26, 26, 26)
+    btn.TextColor3 = Color3.fromRGB(230, 230, 230)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 13
+    btn.Name = "TpText"
+    btn.Text = text
+    btn.Parent = TpPage
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+    
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(45, 45, 45)
+    stroke.Thickness = 1
+    stroke.Parent = btn
+    
+    btn.MouseButton1Click:Connect(callback)
+    return btn
+end
+
+local Tp1 = createTpButton("1. Köy (First Village)", 12, function() walkTeleportTo(Vector3.new(425, 25, -621)) end)
+local Tp2 = createTpButton("2. Köy (Second Village)", 56, function() walkTeleportTo(Vector3.new(-555, 21, -3)) end)
+local TpGrimoire = createTpButton("Grimoire (Kitap)", 100, function()
+    pcall(function()
+        local grimoirePart = workspace.ITENS.Grimori.Part.BaseTop
+        if grimoirePart then walkTeleportTo(grimoirePart.Position + Vector3.new(0, 3, 0)) end
+    end)
+end)
+local TpMentor = createTpButton("Vampire Hunter Mentor", 144, function() walkTeleportTo(Vector3.new(50, 31, 62)) end)
+local TpCamp = createTpButton("Kamp Alanı / Camp Area", 188, function() walkTeleportTo(Vector3.new(152, 35, 322)) end)
+local TpCastle = createTpButton("Vampir Şatosu / Vampire Castle", 232, function() walkTeleportTo(Vector3.new(521, 100, 795)) end)
+local TpCave = createTpButton("KurtAdam Mağarası / Werewolf Cave", 276, function() walkTeleportTo(Vector3.new(796, 41, -294)) end)
+local TpCemetery = createTpButton("Mezarlık / Cemetery", 320, function() walkTeleportTo(Vector3.new(-885, 32, -1311)) end)
+
+-- ESP Toggle Oluşturucu
+local function createEspToggle(text, yPos)
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(1, -24, 0, 40)
+    bg.Position = UDim2.new(0, 12, 0, yPos)
+    bg.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+    bg.BorderSizePixel = 0
+    bg.Parent = EspPage
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = bg
+    
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(40, 40, 40)
+    stroke.Thickness = 1
+    stroke.Parent = bg
+    
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -60, 1, 0)
+    lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Name = "EspText"
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(230, 230, 230)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = bg
+    
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 24, 0, 24)
+    btn.Position = UDim2.new(1, -36, 0.5, -12)
+    btn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    btn.Text = ""
+    btn.Parent = bg
+    
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 4)
+    btnCorner.Parent = btn
+    
+    return btn
+end
+
+local EspHunterBtn = createEspToggle("ESP Hunter", 12)
+local EspGuardBtn = createEspToggle("ESP Guard", 60)
+local EspHumanBtn = createEspToggle("ESP Human", 108)
+local EspPlayerBtn = createEspToggle("ESP Player", 156)
+
+-- Dil Ayarı Arayüzü
+local LangToggleBg = Instance.new("Frame")
+LangToggleBg.Size = UDim2.new(1, -24, 0, 44)
+LangToggleBg.Position = UDim2.new(0, 12, 0, 12)
+LangToggleBg.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+LangToggleBg.BorderSizePixel = 0
+LangToggleBg.Parent = SettingsPage
+
+local LangCorner = Instance.new("UICorner")
+LangCorner.CornerRadius = UDim.new(0, 6)
+LangCorner.Parent = LangToggleBg
+
+local LangLabel = Instance.new("TextLabel")
+LangLabel.Size = UDim2.new(1, -110, 1, 0)
+LangLabel.Position = UDim2.new(0, 12, 0, 0)
+LangLabel.BackgroundTransparency = 1
+LangLabel.Text = "Dil / Language"
+LangLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
+LangLabel.Font = Enum.Font.Gotham
+LangLabel.TextSize = 13
+LangLabel.TextXAlignment = Enum.TextXAlignment.Left
+LangLabel.Parent = LangToggleBg
+
+local LangBtn = Instance.new("TextButton")
+LangBtn.Size = UDim2.new(0, 90, 0, 28)
+LangBtn.Position = UDim2.new(1, -100, 0.5, -14)
+LangBtn.BackgroundColor3 = Color3.fromRGB(160, 25, 25)
+LangBtn.Text = " Türkçe "
+LangBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+LangBtn.Font = Enum.Font.GothamBold
+LangBtn.TextSize = 12
+LangBtn.Parent = LangToggleBg
+
+local LangBtnCorner = Instance.new("UICorner")
+LangBtnCorner.CornerRadius = UDim.new(0, 4)
+LangBtnCorner.Parent = LangBtn
+
+-- Başlıklar ve Togglelar
+local function createSectionTitle(text, yPos)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -24, 0, 20)
+    lbl.Position = UDim2.new(0, 12, 0, yPos)
+    lbl.BackgroundTransparency = 1
+    lbl.Name = "SecTitle"
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(180, 40, 40)
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = FarmingPage
+    return lbl
+end
+
+local function createToggle(name, text, yPos)
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(1, -24, 0, 40)
+    bg.Position = UDim2.new(0, 12, 0, yPos)
+    bg.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+    bg.BorderSizePixel = 0
+    bg.Parent = FarmingPage
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = bg
+    
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(40, 40, 40)
+    stroke.Thickness = 1
+    stroke.Parent = bg
+    
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -60, 1, 0)
+    lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Name = "ToggleText"
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(230, 230, 230)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = bg
+    
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 24, 0, 24)
+    btn.Position = UDim2.new(1, -36, 0.5, -12)
+    btn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    btn.Text = ""
+    btn.Parent = bg
+    
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 4)
+    btnCorner.Parent = btn
+    
+    return btn
+end
+
+local TargetTitle = createSectionTitle("🎯 HEDEF SEÇİMİ", 10)
+local HunterBtn = createToggle("Hunter", "Auto Farm (Hunter)", 32)
+local HumanBtn = createToggle("Human", "Auto Farm (Human)", 78)
+local GuardBtn = createToggle("Guard", "Auto Farm (Guard)", 124)
+local VampireBtn = createToggle("VampireMonster", "Auto Farm (Vampire Monster)", 170)
+
+local AttackTitle = createSectionTitle("⚔️ SALDIRI YÖNÜ", 222)
+local AltBtn = createToggle("Alt", "Alttan Saldır", 244)
+local UstBtn = createToggle("Ust", "Üstten Saldır", 290)
+local ArkaBtn = createToggle("Arka", "Arkadan Saldır", 336)
+
+local DestroyBtn = Instance.new("TextButton")
+DestroyBtn.Size = UDim2.new(1, -24, 0, 40)
+DestroyBtn.Position = UDim2.new(0, 12, 0, 12)
+DestroyBtn.BackgroundColor3 = Color3.fromRGB(160, 25, 25)
+DestroyBtn.Text = "Scripti Tamamen Kapat"
+DestroyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+DestroyBtn.Font = Enum.Font.GothamBold
+DestroyBtn.TextSize = 13
+DestroyBtn.Parent = CancelPage
+
+local DestroyCorners = Instance.new("UICorner")
+DestroyCorners.CornerRadius = UDim.new(0, 6)
+DestroyCorners.Parent = DestroyBtn
+
+-- ==========================================
+-- DİL GÜNCELLEME SİSTEMİ
+-- ==========================================
+local function updateLanguageUI()
+    if currentLanguage == "TR" then
+        TpTabBtn.Text = "Teleport"
+        EspTabBtn.Text = "ESP"
+        FarmingTabBtn.Text = "Farming"
+        SettingsTabBtn.Text = "Ayarlar"
+        CreditTabBtn.Text = "Credit"
+        CancelTabBtn.Text = "İptal Et"
+        LangBtn.Text = " Türkçe "
+        
+        Tp1.Text = "1. Köy (First Village)"
+        Tp2.Text = "2. Köy (Second Village)"
+        TpGrimoire.Text = "Grimoire (Kitap)"
+        TpMentor.Text = "Vampir Avcısı Eğitmeni"
+        TpCamp.Text = "Kamp Alanı"
+        TpCastle.Text = "Vampir Şatosu"
+        TpCave.Text = "KurtAdam Mağarası"
+        TpCemetery.Text = "Mezarlık (Cemetery)"
+
+        EspHunterBtn.Parent.EspText.Text = "ESP Hunter"
+        EspGuardBtn.Parent.EspText.Text = "ESP Guard"
+        EspHumanBtn.Parent.EspText.Text = "ESP Human"
+        EspPlayerBtn.Parent.EspText.Text = "ESP Player"
+        TargetTitle.Text = "🎯 HEDEF SEÇİMİ"
+        AttackTitle.Text = "⚔️ SALDIRI YÖNÜ"
+        HunterBtn.Parent.ToggleText.Text = "Auto Farm (Hunter)"
+        HumanBtn.Parent.ToggleText.Text = "Auto Farm (Human)"
+        GuardBtn.Parent.ToggleText.Text = "Auto Farm (Guard)"
+        VampireBtn.Parent.ToggleText.Text = "Auto Farm (Vampire Monster)"
+        AltBtn.Parent.ToggleText.Text = "Alttan Saldır"
+        UstBtn.Parent.ToggleText.Text = "Üstten Saldır"
+        ArkaBtn.Parent.ToggleText.Text = "Arkadan Saldır"
+        DestroyBtn.Text = "Scripti Tamamen Kapat"
+    else
+        TpTabBtn.Text = "Teleport"
+        EspTabBtn.Text = "ESP"
+        FarmingTabBtn.Text = "Farming"
+        SettingsTabBtn.Text = "Settings"
+        CreditTabBtn.Text = "Credit"
+        CancelTabBtn.Text = "Cancel"
+        LangBtn.Text = " English "
+        
+        Tp1.Text = "First Village"
+        Tp2.Text = "Second Village"
+        TpGrimoire.Text = "Grimoire (Book)"
+        TpMentor.Text = "Vampire Hunter Mentor"
+        TpCamp.Text = "Camp Area"
+        TpCastle.Text = "Vampire Castle"
+        TpCave.Text = "Werewolf Cave"
+        TpCemetery.Text = "Cemetery"
+
+        EspHunterBtn.Parent.EspText.Text = "ESP Hunter"
+        EspGuardBtn.Parent.EspText.Text = "ESP Guard"
+        EspHumanBtn.Parent.EspText.Text = "ESP Human"
+        EspPlayerBtn.Parent.EspText.Text = "ESP Player"
+        TargetTitle.Text = "🎯 TARGET SELECTION"
+        AttackTitle.Text = "⚔️ ATTACK DIRECTION"
+        HunterBtn.Parent.ToggleText.Text = "Auto Farm (Hunter)"
+        HumanBtn.Parent.ToggleText.Text = "Auto Farm (Human)"
+        GuardBtn.Parent.ToggleText.Text = "Auto Farm (Guard)"
+        VampireBtn.Parent.ToggleText.Text = "Auto Farm (Vampire Monster)"
+        AltBtn.Parent.ToggleText.Text = "Attack from Bottom"
+        UstBtn.Parent.ToggleText.Text = "Attack from Top"
+        ArkaBtn.Parent.ToggleText.Text = "Attack from Behind"
+        DestroyBtn.Text = "Fully Destroy Script"
+    end
+end
+
+-- ==========================================
+-- UI İŞLEVLERİ VE SEKME GEÇİŞLERİ
+-- ==========================================
+local function resetFarmState()
+    currentTarget = nil
+    blacklistedTargets = {}
+    updateOffsets() 
+    currentOffset = safeOffset
+end
+
+local function updateUI()
+    local activeColor = Color3.fromRGB(180, 30, 30)
+    local defaultColor = Color3.fromRGB(40, 40, 40)
+
+    HunterBtn.BackgroundColor3 = (farmMode == "Hunter") and activeColor or defaultColor
+    HumanBtn.BackgroundColor3 = (farmMode == "Human") and activeColor or defaultColor
+    GuardBtn.BackgroundColor3 = (farmMode == "Guard") and activeColor or defaultColor
+    VampireBtn.BackgroundColor3 = (farmMode == "VampireMonster") and activeColor or defaultColor
+    
+    AltBtn.BackgroundColor3 = (attackDirection == "Alt") and activeColor or defaultColor
+    UstBtn.BackgroundColor3 = (attackDirection == "Üst") and activeColor or defaultColor
+    ArkaBtn.BackgroundColor3 = (attackDirection == "Arka") and activeColor or defaultColor
+
+    EspHunterBtn.BackgroundColor3 = espHunter and activeColor or defaultColor
+    EspGuardBtn.BackgroundColor3 = espGuard and activeColor or defaultColor
+    EspHumanBtn.BackgroundColor3 = espHuman and activeColor or defaultColor
+    EspPlayerBtn.BackgroundColor3 = espPlayer and activeColor or defaultColor
+end
+
+updateUI()
+
+TpTabBtn.MouseButton1Click:Connect(function()
+    TpPage.Visible = true; EspPage.Visible = false; FarmingPage.Visible = false; SettingsPage.Visible = false; CreditPage.Visible = false; CancelPage.Visible = false
+end)
+EspTabBtn.MouseButton1Click:Connect(function()
+    TpPage.Visible = false; EspPage.Visible = true; FarmingPage.Visible = false; SettingsPage.Visible = false; CreditPage.Visible = false; CancelPage.Visible = false
+end)
+FarmingTabBtn.MouseButton1Click:Connect(function()
+    TpPage.Visible = false; EspPage.Visible = false; FarmingPage.Visible = true; SettingsPage.Visible = false; CreditPage.Visible = false; CancelPage.Visible = false
+end)
+SettingsTabBtn.MouseButton1Click:Connect(function()
+    TpPage.Visible = false; EspPage.Visible = false; FarmingPage.Visible = false; SettingsPage.Visible = true; CreditPage.Visible = false; CancelPage.Visible = false
+end)
+CreditTabBtn.MouseButton1Click:Connect(function()
+    TpPage.Visible = false; EspPage.Visible = false; FarmingPage.Visible = false; SettingsPage.Visible = false; CreditPage.Visible = true; CancelPage.Visible = false
+end)
+CancelTabBtn.MouseButton1Click:Connect(function()
+    TpPage.Visible = false; EspPage.Visible = false; FarmingPage.Visible = false; SettingsPage.Visible = false; CreditPage.Visible = false; CancelPage.Visible = true
+end)
+
+LangBtn.MouseButton1Click:Connect(function()
+    currentLanguage = (currentLanguage == "TR") and "EN" or "TR"
+    updateLanguageUI()
+end)
+
+EspHunterBtn.MouseButton1Click:Connect(function() espHunter = not espHunter; updateUI() end)
+EspGuardBtn.MouseButton1Click:Connect(function() espGuard = not espGuard; updateUI() end)
+EspHumanBtn.MouseButton1Click:Connect(function() espHuman = not espHuman; updateUI() end)
+EspPlayerBtn.MouseButton1Click:Connect(function() espPlayer = not espPlayer; updateUI() end)
+
+HunterBtn.MouseButton1Click:Connect(function() farmMode = (farmMode == "Hunter") and "None" or "Hunter"; resetFarmState(); updateUI() end)
+HumanBtn.MouseButton1Click:Connect(function() farmMode = (farmMode == "Human") and "None" or "Human"; resetFarmState(); updateUI() end)
+GuardBtn.MouseButton1Click:Connect(function() farmMode = (farmMode == "Guard") and "None" or "Guard"; resetFarmState(); updateUI() end)
+VampireBtn.MouseButton1Click:Connect(function() farmMode = (farmMode == "VampireMonster") and "None" or "VampireMonster"; resetFarmState(); updateUI() end)
+
+AltBtn.MouseButton1Click:Connect(function() attackDirection = "Alt"; updateOffsets(); updateUI() end)
+UstBtn.MouseButton1Click:Connect(function() attackDirection = "Üst"; updateOffsets(); updateUI() end)
+ArkaBtn.MouseButton1Click:Connect(function() attackDirection = "Arka"; updateOffsets(); updateUI() end)
+
+DestroyBtn.MouseButton1Click:Connect(function()
+    scriptRunning = false
+    farmMode = "None"
+    for _, esp in pairs(activeEspObjects) do if esp then esp:Destroy() end end
+    ScreenGui:Destroy()
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not gameProcessed and input.KeyCode == Enum.KeyCode.Insert then
+        if isKeyVerified then
+            MainFrame.Visible = not MainFrame.Visible
+        end
+    end
+end)
+
+-- ==========================================
+-- ESP RENDER MANTIĞI
+-- ==========================================
+local function manageEspForModel(model, prefix, enabled, customColor, customTransparency)
+    if not model or not model:FindFirstChild("HumanoidRootPart") then return end
+    local hrp = model.HumanoidRootPart
+    local existingEsp = hrp:FindFirstChild("VampireESP")
+    
+    if enabled and model:FindFirstChild("Humanoid") and model.Humanoid.Health > 0 then
+        if not existingEsp then
+            local bill = Instance.new("BillboardGui")
+            bill.Name = "VampireESP"
+            bill.Size = UDim2.new(0, 100, 0, 40)
+            bill.StudsOffset = Vector3.new(0, 3, 0)
+            bill.AlwaysOnTop = true
+            bill.Parent = hrp
+            
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, 0, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.Font = Enum.Font.GothamBold
+            lbl.TextSize = 12
+            lbl.TextStrokeTransparency = 0.5
+            lbl.Parent = bill
+            
+            table.insert(activeEspObjects, bill)
+        end
+        
+        local bill = hrp.VampireESP
+        local lbl = bill.TextLabel
+        lbl.TextColor3 = customColor or Color3.fromRGB(255, 255, 255)
+        lbl.TextTransparency = customTransparency or 0.3
+        
+        local dist = player.Character and player.Character:FindFirstChild("HumanoidRootPart") and math.floor((hrp.Position - player.Character.HumanoidRootPart.Position).Magnitude) or 0
+        lbl.Text = string.format("[%s]\n[%dm]", prefix, dist)
+    else
+        if existingEsp then existingEsp:Destroy() end
+    end
+end
+
+local function getPlayerRaceAndColor(plrChar)
+    local raceName = "Player"
+    if plrChar:FindFirstChild("Werewolf") or plrChar:FindFirstChild("WolfTag") or string.find(string.lower(plrChar.Name), "wolf") then
+        raceName = "Werewolf"
+    elseif plrChar:FindFirstChild("VampireTag") or string.find(string.lower(plrChar.Name), "vampire") then
+        raceName = "Vampire"
+    end
+    return raceName
+end
+
+RunService.RenderStepped:Connect(function()
+    if not scriptRunning then return end
+    
+    local huntersFolder = workspace:FindFirstChild("NPCS") and workspace.NPCS:FindFirstChild("HUNTERS")
+    if huntersFolder then
+        for _, obj in pairs(huntersFolder:GetChildren()) do
+            if string.find(obj.Name, "Hunter") then manageEspForModel(obj, "Hunter", espHunter, Color3.fromRGB(255, 120, 50), 0.2) end
+        end
+    end
+    
+    local guardsFolder = workspace:FindFirstChild("NPCS") and workspace.NPCS:FindFirstChild("ACTIVE_GUARDS")
+    if guardsFolder then
+        for _, obj in pairs(guardsFolder:GetChildren()) do
+            if string.find(obj.Name, "Guard") then manageEspForModel(obj, "Guard", espGuard, Color3.fromRGB(200, 200, 50), 0.2) end
+        end
+    end
+    
+    local humansFolder = workspace:FindFirstChild("Humans")
+    if humansFolder then
+        for _, obj in pairs(humansFolder:GetChildren()) do
+            if obj.Name == "Human" then manageEspForModel(obj, "Human", espHuman, Color3.fromRGB(50, 150, 255), 0.2) end
+        end
+    end
+
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            local race = getPlayerRaceAndColor(plr.Character)
+            manageEspForModel(plr.Character, plr.Name .. " (" .. race .. ")", espPlayer, Color3.fromRGB(240, 240, 240), 0.3)
+        end
+    end
+end)
+
+-- ==========================================
+-- HEDEF BULMA VE ÇEKİRDEK FARM MANTIĞI
+-- ==========================================
+task.spawn(function()
+    while task.wait(60) do
+        if scriptRunning then blacklistedTargets = {} end
+    end
+end)
+
+local function getNextTarget()
+    local closestTarget = nil
+    local shortestDistance = math.huge
+    if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then return nil end
+    local myPos = player.Character.HumanoidRootPart.Position
+    
+    if farmMode == "Hunter" then
+        local huntersFolder = workspace:FindFirstChild("NPCS") and workspace.NPCS:FindFirstChild("HUNTERS")
+        if huntersFolder then
+            for _, obj in pairs(huntersFolder:GetChildren()) do
+                if string.find(obj.Name, "Hunter") and not blacklistedTargets[obj] and obj:FindFirstChild("Humanoid") and obj.Humanoid.Health > 0 then
+                    local hrp = obj:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local distance = (hrp.Position - myPos).Magnitude
+                        if distance < shortestDistance then shortestDistance = distance; closestTarget = obj end
+                    end
+                end
+            end
+        end
+    elseif farmMode == "Human" then
+        local humansFolder = workspace:FindFirstChild("Humans")
+        if humansFolder then
+            for _, obj in pairs(humansFolder:GetChildren()) do
+                if obj.Name == "Human" and not blacklistedTargets[obj] and obj:FindFirstChild("Humanoid") and obj.Humanoid.Health > 0 then
+                    local hrp = obj:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local distance = (hrp.Position - myPos).Magnitude
+                        if distance < shortestDistance then shortestDistance = distance; closestTarget = obj end
+                    end
+                end
+            end
+        end
+    elseif farmMode == "Guard" then
+        local guardsFolder = workspace:FindFirstChild("NPCS") and workspace.NPCS:FindFirstChild("ACTIVE_GUARDS")
+        if guardsFolder then
+            for _, obj in pairs(guardsFolder:GetChildren()) do
+                if string.find(obj.Name, "Guard") and not blacklistedTargets[obj] and obj:FindFirstChild("Humanoid") and obj.Humanoid.Health > 0 then
+                    local hrp = obj:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local distance = (hrp.Position - myPos).Magnitude
+                        if distance < shortestDistance then shortestDistance = distance; closestTarget = obj end
+                    end
+                end
+            end
+        end
+    elseif farmMode == "VampireMonster" then
+        local vampireFolder = workspace:FindFirstChild("VampireMonsters")
+        if vampireFolder then
+            for _, obj in pairs(vampireFolder:GetChildren()) do
+                if obj.Name == "Vampire Monster" and not blacklistedTargets[obj] and obj:FindFirstChild("Humanoid") and obj.Humanoid.Health > 0 then
+                    local targetNode = obj:FindFirstChild("VAMPIRE_VAMPIRE_0")
+                    if targetNode then
+                        local distance = (targetNode.Position - myPos).Magnitude
+                        if distance < shortestDistance then shortestDistance = distance; closestTarget = obj end
+                    end
+                end
+            end
+        end
+    end
+    return closestTarget
+end
+
+local function fireRemoteAttack()
+    local funcoes = ReplicatedStorage:FindFirstChild("Funções")
+    if funcoes then
+        local gameFists = funcoes:FindFirstChild("Game15Fists")
+        if gameFists then
+            local combatRemote = gameFists:FindFirstChild("CombatRemote")
+            if combatRemote then combatRemote:FireServer("Attack") end
+        end
+    end
+end
+
+RunService.Stepped:Connect(function()
+    if scriptRunning and (farmMode ~= "None" or isTeleporting) and player.Character then
+        for _, part in pairs(player.Character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+        end
+    end
+end)
+
+task.spawn(function()
+    while task.wait() do 
+        if not scriptRunning then break end
+        if farmMode ~= "None" and currentTarget and currentTarget:FindFirstChild("Humanoid") and currentTarget.Humanoid.Health > 0 then
+            if farmMode == "Guard" then
+                currentOffset = attackOffset
+                task.wait(0.15) 
+                fireRemoteAttack()
+                task.wait(0.35)
+                currentOffset = safeOffset
+                task.wait(0.75)
+            else
+                currentOffset = attackOffset
+                task.wait(0.15) 
+                fireRemoteAttack()
+                task.wait(0.45)
+                currentOffset = safeOffset
+                task.wait(0.08) 
+            end
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if not scriptRunning or isTeleporting then return end
+    if farmMode ~= "None" and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+        local hrp = player.Character.HumanoidRootPart
+        if not currentTarget or not currentTarget.Parent or not currentTarget:FindFirstChild("Humanoid") or currentTarget.Humanoid.Health <= 0 then
+            currentTarget = getNextTarget()
+            currentOffset = safeOffset
+            if currentTarget then attackTimer = tick(); lastHealth = currentTarget.Humanoid.Health end
+        end
+        if currentTarget then
+            local targetPart = nil
+            if farmMode == "Hunter" or farmMode == "Human" or farmMode == "Guard" then
+                targetPart = currentTarget:FindFirstChild("HumanoidRootPart")
+            elseif farmMode == "VampireMonster" then
+                targetPart = currentTarget:FindFirstChild("VAMPIRE_VAMPIRE_0")
+            end
+            if targetPart then
+                local currentHealth = currentTarget.Humanoid.Health
+                if currentHealth < lastHealth then lastHealth = currentHealth; attackTimer = tick() end
+                local timeoutLimit = (farmMode == "Guard") and 5 or ((farmMode == "VampireMonster") and 8 or 4)
+                if tick() - attackTimer > timeoutLimit then
+                    blacklistedTargets[currentTarget] = true
+                    currentTarget = nil 
+                    currentOffset = safeOffset
+                    return 
+                end
+                local targetPosition = (targetPart.CFrame * currentOffset).Position
+                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                hrp.CFrame = CFrame.lookAt(targetPosition, targetPart.Position)
+            end
+        end
+    end
+end)
